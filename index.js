@@ -39,6 +39,7 @@ for (const key of REQUIRED) {
 }
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
+const MAX_STREAM_CLIENTS = parseInt(process.env.MAX_STREAM_CLIENTS || "10", 10);
 const logger      = new Logger();
 const broadcaster = new Broadcaster(logger);
 const audioHandler = new AudioHandler(logger, broadcaster);
@@ -59,8 +60,14 @@ let botId = null;
  * Bot lifecycle events: joining → InMeeting → Stopped, participant join/leave, etc.
  */
 app.post("/webhook/callback", (req, res) => {
-  res.sendStatus(200);
-  logger.event(req.body);
+  res.sendStatus(200);  // ack immediately regardless — MeetStream expects 200 fast
+
+  const body = req.body;
+  if (!body || typeof body !== "object") {
+    logger.error("Malformed callback payload — ignoring", new Error(JSON.stringify(body)));
+    return;
+  }
+  logger.event(body);
 });
 
 /**
@@ -69,8 +76,15 @@ app.post("/webhook/callback", (req, res) => {
  */
 app.post("/webhook/transcript", (req, res) => {
   res.sendStatus(200);
-  const { speakerName, transcript, timestamp, words } = req.body;
-  if (transcript?.trim()) {
+
+  const body = req.body;
+  if (!body || typeof body !== "object") {
+    logger.error("Malformed transcript payload — ignoring", new Error(JSON.stringify(body)));
+    return;
+  }
+
+  const { speakerName, transcript, timestamp, words } = body;
+  if (typeof transcript === "string" && transcript.trim()) {
     logger.transcript(speakerName, transcript, timestamp, words);
   }
 });
@@ -83,7 +97,7 @@ app.post("/webhook/transcript", (req, res) => {
  *   • forwards it to Broadcaster → all /stream clients
  */
 app.ws("/audio", (ws) => {
-  logger.info(chalk.cyan("MeetStream audio WebSocket connected"));
+  logger.info(chalk.cyan("🔌  MeetStream audio WebSocket connected"));
 
   ws.on("message", (data) => {
     if (Buffer.isBuffer(data)) {
@@ -94,7 +108,7 @@ app.ws("/audio", (ws) => {
   });
 
   ws.on("close", () => {
-    logger.info(chalk.yellow("MeetStream audio WebSocket closed"));
+    logger.info(chalk.yellow("🔌  MeetStream audio WebSocket closed"));
     audioHandler.flush();
   });
 
@@ -121,6 +135,11 @@ app.ws("/audio", (ws) => {
  *   ws.on("message", (buf) => { ... parse frame ... });
  */
 app.ws("/stream", (ws) => {
+  if (broadcaster.size >= MAX_STREAM_CLIENTS) {
+    logger.error(`Stream consumer limit (${MAX_STREAM_CLIENTS}) reached — rejecting new connection`);
+    ws.close(1013, "Server too busy — max consumers reached"); // 1013 = "try again later"
+    return;
+  }
   broadcaster.add(ws);
 });
 
@@ -154,6 +173,20 @@ async function main() {
   const publicUrl = listener.url();
   logger.info(`ngrok tunnel: ${chalk.green(publicUrl)}`);
 
+  // ngrok's Node SDK doesn't expose a clean "disconnected" event on the
+  // listener itself, but if the underlying agent connection drops, all
+  // webhook/websocket traffic silently stops arriving. We can't auto-heal
+  // this (would require re-creating the bot with a new URL), but we can
+  // at least surface it loudly instead of sitting silent for the rest
+  // of the meeting.
+  listener.session?.onClose?.(() => {
+    logger.error(
+      "ngrok session closed unexpectedly — webhooks and audio will stop arriving. " +
+      "Restart the process to recover.",
+      new Error("ngrok session closed")
+    );
+  });
+
   // 3. Build URLs
   const callbackUrl    = `${publicUrl}/webhook/callback`;
   const transcriptUrl  = `${publicUrl}/webhook/transcript`;
@@ -176,21 +209,47 @@ async function main() {
   logger.info("Waiting for bot to join the meeting…");
   logger.info(chalk.dim("Press Ctrl+C to stop the bot and exit.\n"));
 
-  // 5. Graceful shutdown
+  // ── Shared shutdown path ─────────────────────────────────────────────────
+  // Used by SIGINT/SIGTERM *and* by the crash handlers below, so an
+  // uncaught exception doesn't leave the bot orphaned in the meeting.
+  let shuttingDown = false;
+  async function shutdown(reason) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log("");
+    logger.info(`Shutting down… (${reason})`);
+    if (botId) {
+      await client.removeBot(botId).catch((e) => logger.error("removeBot failed", e));
+      logger.info(`Bot ${botId} removed.`);
+    }
+    audioHandler.flush();
+    await ngrok.disconnect().catch(() => {});
+    server.close();
+  }
+
   for (const sig of ["SIGINT", "SIGTERM"]) {
     process.on(sig, async () => {
-      console.log("");
-      logger.info("Shutting down…");
-      if (botId) {
-        await client.removeBot(botId).catch(() => {});
-        logger.info(`Bot ${botId} removed.`);
-      }
-      audioHandler.flush();
-      await ngrok.disconnect().catch(() => {});
-      server.close();
+      await shutdown(sig);
       process.exit(0);
     });
   }
+
+  // ── Crash safety net ─────────────────────────────────────────────────────
+  // Without this, an uncaught exception anywhere (a bad webhook payload,
+  // a provider throwing, anything) kills the process immediately — the bot
+  // stays in the meeting indefinitely with nothing recording, and ngrok
+  // keeps the tunnel open pointing at a dead server.
+  process.on("uncaughtException", async (err) => {
+    logger.error("Uncaught exception — shutting down safely", err);
+    await shutdown("uncaughtException");
+    process.exit(1);
+  });
+
+  process.on("unhandledRejection", async (err) => {
+    logger.error("Unhandled promise rejection — shutting down safely", err instanceof Error ? err : new Error(String(err)));
+    await shutdown("unhandledRejection");
+    process.exit(1);
+  });
 }
 
 main().catch((err) => {

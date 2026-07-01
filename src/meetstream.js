@@ -8,6 +8,16 @@
 
 const BASE_URL = "https://api.meetstream.ai/api/v1";
 
+// Retry tuning — generous enough to survive transient blips without
+// hammering the API. 429/5xx are retried; 4xx (bad request, bad auth) are not.
+const MAX_RETRIES = 4;
+const BASE_DELAY_MS = 500;     // first retry waits ~500ms
+const MAX_DELAY_MS = 8000;     // never wait longer than 8s between retries
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export class MeetStreamClient {
   constructor(apiKey, logger) {
     this.apiKey = apiKey;
@@ -21,24 +31,73 @@ export class MeetStreamClient {
     };
   }
 
+  /**
+   * Issues a request with automatic retry on transient failures.
+   *
+   *  - 429 (rate limited): honors `Retry-After` header if present,
+   *    otherwise falls back to exponential backoff.
+   *  - 5xx (server error) or network failure: exponential backoff.
+   *  - 4xx other than 429 (bad request, bad auth, not found): fails
+   *    immediately — retrying won't fix a malformed request or bad key.
+   */
   async #request(method, path, body) {
     const url = `${BASE_URL}${path}`;
-    const res = await fetch(url, {
-      method,
-      headers: this.#headers(),
-      body: body ? JSON.stringify(body) : undefined,
-    });
+    let lastErr;
 
-    const text = await res.text();
-    let data;
-    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const res = await fetch(url, {
+          method,
+          headers: this.#headers(),
+          body: body ? JSON.stringify(body) : undefined,
+        });
 
-    if (!res.ok) {
-      throw new Error(
-        `MeetStream API ${method} ${path} → ${res.status}: ${text}`
-      );
+        const text = await res.text();
+        let data;
+        try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+        if (res.ok) return data;
+
+        // Non-retryable: bad request / auth / not found — fail fast
+        if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+          throw new Error(`MeetStream API ${method} ${path} → ${res.status}: ${text}`);
+        }
+
+        // Retryable: 429 (rate limited) or 5xx (server-side issue)
+        lastErr = new Error(`MeetStream API ${method} ${path} → ${res.status}: ${text}`);
+
+        if (attempt < MAX_RETRIES) {
+          const retryAfterHeader = res.headers.get("retry-after");
+          const delay = retryAfterHeader
+            ? parseInt(retryAfterHeader, 10) * 1000
+            : Math.min(BASE_DELAY_MS * 2 ** attempt, MAX_DELAY_MS);
+
+          this.logger.info(
+            `MeetStream API ${res.status} on ${path} — retrying in ${(delay / 1000).toFixed(1)}s ` +
+            `(attempt ${attempt + 1}/${MAX_RETRIES})`
+          );
+          await sleep(delay);
+          continue;
+        }
+      } catch (err) {
+        // Network-level failure (DNS, connection reset, timeout, etc.)
+        lastErr = err;
+        if (err.message?.includes("MeetStream API") && !err.message.includes("→ 5") && !err.message.includes("→ 429")) {
+          throw err; // non-retryable API error thrown above — propagate immediately
+        }
+        if (attempt < MAX_RETRIES) {
+          const delay = Math.min(BASE_DELAY_MS * 2 ** attempt, MAX_DELAY_MS);
+          this.logger.info(
+            `Network error on ${path} — retrying in ${(delay / 1000).toFixed(1)}s ` +
+            `(attempt ${attempt + 1}/${MAX_RETRIES}): ${err.message}`
+          );
+          await sleep(delay);
+          continue;
+        }
+      }
     }
-    return data;
+
+    throw lastErr;
   }
 
   /**
@@ -59,7 +118,7 @@ export class MeetStreamClient {
       bot_name: "MeetStream Labs Bot",
       audio_required: true,
       video_required: false,
-      bot_message: "MeetStream Labs bot is recording this meeting.",
+      bot_message: "👋 MeetStream Labs bot is recording this meeting.",
 
       // Bot lifecycle events → our webhook
       callback_url: callbackUrl,

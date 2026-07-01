@@ -274,6 +274,7 @@ MeetStream bot → your server → /stream → bridge.js → [any provider] → 
 | Console (debug, no network) | `console` | nothing — works immediately |
 | Deepgram | `deepgram` | `DEEPGRAM_API_KEY` ([free signup](https://console.deepgram.com/signup), $200 credit) |
 | AssemblyAI | `assemblyai` | `ASSEMBLYAI_API_KEY` ([free signup](https://www.assemblyai.com/dashboard/signup)) |
+| OpenAI GPT-Realtime-Whisper | `openai-whisper` | `OPENAI_API_KEY` ([platform.openai.com](https://platform.openai.com/api-keys)) |
 
 ### Switching providers
 
@@ -355,3 +356,28 @@ Waiting for meeting audio… speak in the meeting now.
 - [Live transcripts](https://docs.meetstream.ai/api-reference/live-transcripts)
 - [Socket connection](https://docs.meetstream.ai/api-reference/socket-connection)
 - [ngrok Node SDK](https://ngrok.com/docs/using-ngrok-with/node-js/)
+
+## Resilience — what's handled and what isn't
+
+This started as an example project and has since had production-readiness gaps closed incrementally. Current state:
+
+| Concern | Status | Where |
+|---|---|---|
+| MeetStream API retry on 429/5xx | ✅ Exponential backoff, respects `Retry-After` | `src/meetstream.js` |
+| MeetStream API non-retryable errors fail fast | ✅ Bad auth/request errors don't waste time retrying | `src/meetstream.js` |
+| Provider socket reconnect (Deepgram) | ✅ Auto-reconnect with backoff, drops frames (not buffers) while down | `src/providers/reconnect-helper.js` |
+| Provider socket reconnect (AssemblyAI, OpenAI) | ⚠️ Not yet wired — follow the Deepgram pattern to add | `src/providers/*.js` |
+| Slow `/stream` consumer backpressure | ✅ Disconnected if buffered output exceeds 2MB | `src/broadcaster.js` |
+| Max concurrent `/stream` consumers | ✅ Capped via `MAX_STREAM_CLIENTS` (default 10) | `index.js` |
+| Uncaught exception / unhandled rejection safety | ✅ Removes bot + closes tunnel before exiting, instead of leaving an orphaned bot in the meeting | `index.js` |
+| Malformed webhook payload handling | ✅ Validated before use, logged and ignored rather than crashing | `index.js` |
+| ngrok tunnel drop detection | ⚠️ Detected and logged loudly; **not auto-healed** — recovering requires a new public URL, which means re-creating the bot. Manual restart needed. | `index.js` |
+| Webhook authenticity verification | ❌ Not implemented — anyone who discovers your ngrok URL could POST fake events. Low risk for short-lived demo tunnels, real risk for anything long-running or sensitive. | — |
+| Horizontal scaling / multiple bots per process | ❌ Single bot per process by design — running multiple meetings means multiple process instances | — |
+
+### Taking this further toward real production use
+
+The two gaps most worth closing next, in order of impact:
+
+1. **Webhook signature verification** — check whether MeetStream signs webhook payloads (HMAC header or similar) and verify it before trusting the body. Right now anyone who finds your ngrok URL can POST fabricated transcript/lifecycle events.
+2. **ngrok auto-recovery** — on tunnel drop, the cleanest fix is: detect it (already done), then automatically `removeBot` + `createBot` again with a fresh tunnel URL, accepting the bot briefly leaves and rejoins the meeting. Not implemented here since it changes bot behavior mid-meeting in a way you may not want happening silently.

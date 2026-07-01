@@ -22,6 +22,12 @@
 import { WebSocket } from "ws";
 import chalk from "chalk";
 
+// If a consumer's outbound buffer grows past this, they're too slow to keep
+// up with live audio — disconnect them rather than let memory grow unbounded.
+// 2MB ≈ ~10 seconds of buffered 48kHz/16-bit/mono audio, generous enough to
+// absorb brief network jitter but small enough to catch a truly stuck client.
+const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
+
 export class Broadcaster {
   constructor(logger) {
     this.logger  = logger;
@@ -38,7 +44,7 @@ export class Broadcaster {
     this.clients.add(ws);
     const count = this.clients.size;
     this.logger.info(
-      chalk.green(`Stream consumer connected`) +
+      chalk.green(`📡  Stream consumer connected`) +
       chalk.dim(` — ${count} client${count === 1 ? "" : "s"} listening`)
     );
 
@@ -54,7 +60,7 @@ export class Broadcaster {
     ws.on("close", () => {
       this.clients.delete(ws);
       this.logger.info(
-        chalk.yellow(`Stream consumer disconnected`) +
+        chalk.yellow(`📡  Stream consumer disconnected`) +
         chalk.dim(` — ${this.clients.size} remaining`)
       );
     });
@@ -69,6 +75,10 @@ export class Broadcaster {
    * Called by AudioHandler for every decoded PCM frame.
    * Builds a lightweight binary envelope and sends to all live consumers.
    *
+   * Backpressure: any consumer whose buffered (unsent) bytes exceed
+   * MAX_BUFFERED_BYTES is forcibly disconnected. A slow consumer otherwise
+   * causes Node to queue frames in memory indefinitely — this caps that.
+   *
    * @param {string} speakerName
    * @param {Buffer} pcmBuffer  — raw PCM16 LE bytes
    */
@@ -79,14 +89,24 @@ export class Broadcaster {
     let dead = null;
 
     for (const ws of this.clients) {
-      if (ws.readyState === WebSocket.OPEN) {
-        this.#send(ws, frame);
-      } else {
+      if (ws.readyState !== WebSocket.OPEN) {
         (dead ??= []).push(ws);
+        continue;
       }
+
+      if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+        this.logger.error(
+          `Stream consumer too slow (${(ws.bufferedAmount / 1024).toFixed(0)} KB buffered) — disconnecting`
+        );
+        ws.terminate();
+        (dead ??= []).push(ws);
+        continue;
+      }
+
+      this.#send(ws, frame);
     }
 
-    // Prune any sockets that closed between frames
+    // Prune any sockets that closed or were terminated this round
     if (dead) for (const ws of dead) this.clients.delete(ws);
   }
 
